@@ -30,6 +30,14 @@
   <section id="adminPanel" class="hidden">
     <div class="hero"><div><h1>Trung tâm quản trị</h1><p>Chỉnh thông báo hiển thị cho người dùng và theo dõi sức khỏe các server vệ tinh.</p></div><div class="scan-status" id="lastUpdated">Chưa quét sức khỏe</div></div>
     <div class="grid">
+      <div style="display:grid;gap:18px">
+      <div class="card">
+        <div class="card-head"><div><div class="card-title"><i class="fa-solid fa-users-gear" style="color:var(--green)"></i> Giới hạn tài khoản/job</div><div class="card-sub">Áp dụng cho license key thường; Master Token không bị giới hạn.</div></div></div>
+        <div class="card-body">
+          <div class="field"><label for="maxAccountsPerJob">Số tài khoản tối đa/job <small>từ 1 đến 1.000.000</small></label><input id="maxAccountsPerJob" class="input" type="number" min="1" max="1000000" step="1" inputmode="numeric"></div>
+          <button id="saveAccountLimitBtn" class="btn btn-primary" onclick="saveAccountLimit()"><i class="fa-solid fa-floppy-disk"></i> Lưu giới hạn</button>
+        </div>
+      </div>
       <div class="card">
         <div class="card-head"><div><div class="card-title"><i class="fa-solid fa-bullhorn" style="color:var(--amber)"></i> Thông báo hệ thống</div><div class="card-sub">Nội dung này hiển thị trên trang Master cho tất cả người dùng.</div></div></div>
         <div class="card-body">
@@ -38,6 +46,7 @@
           <div class="field"><label for="noticeCss">CSS thông báo <small>nên giới hạn selector trong #noticeBox</small></label><textarea id="noticeCss" class="textarea code css-code" maxlength="20000" spellcheck="false" placeholder="#noticeBox { ... }"></textarea></div>
           <button id="saveNoticeBtn" class="btn btn-primary" onclick="saveNotice()"><i class="fa-solid fa-floppy-disk"></i> Lưu thông báo</button>
         </div>
+      </div>
       </div>
 
       <div class="card">
@@ -71,7 +80,8 @@ async function verify(){if(!TOKEN)return false;try{const data=await request('/ap
 async function login(){TOKEN=$('tokenInput').value.trim();if(!TOKEN){toast('Vui lòng nhập Master Token');return;}if(!await verify()){toast('Master Token không hợp lệ');return;}localStorage.setItem('masterToken',TOKEN);localStorage.setItem('licenseKey',TOKEN);showAdmin();}
 async function showAdmin(){$('authPanel').classList.add('hidden');$('adminPanel').classList.remove('hidden');try{await loadSettings();scanHealth();configureAutoScan();}catch(error){toast(error.message);}}
 async function boot(){if(await verify())showAdmin();else{$('tokenInput').value=TOKEN;$('authPanel').classList.remove('hidden');}}
-async function loadSettings(){const data=await request('/api/admin/settings');$('noticeEnabled').checked=data.notice.enabled!==false;$('noticeHtml').value=data.notice.html||'';$('noticeCss').value=data.notice.css||'';$('satelliteTargets').value=data.satellite_targets||'';}
+async function loadSettings(){const data=await request('/api/admin/settings');$('noticeEnabled').checked=data.notice.enabled!==false;$('noticeHtml').value=data.notice.html||'';$('noticeCss').value=data.notice.css||'';$('satelliteTargets').value=data.satellite_targets||'';$('maxAccountsPerJob').value=Number(data.max_accounts_per_job)||1000;}
+async function saveAccountLimit(){const button=$('saveAccountLimitBtn');const value=Number($('maxAccountsPerJob').value);if(!Number.isInteger(value)||value<1||value>1000000){toast('Giới hạn tài khoản/job phải là số nguyên từ 1 đến 1.000.000');return;}button.disabled=true;try{await request('/api/admin/settings',{method:'POST',body:JSON.stringify({max_accounts_per_job:value})});await loadSettings();toast('Đã lưu giới hạn '+value.toLocaleString('vi-VN')+' tài khoản/job');}catch(error){toast(error.message);}finally{button.disabled=false;}}
 async function saveNotice(){const button=$('saveNoticeBtn');button.disabled=true;try{await request('/api/admin/settings',{method:'POST',body:JSON.stringify({notice:{enabled:$('noticeEnabled').checked,html:$('noticeHtml').value.trim(),css:$('noticeCss').value.trim()}})});toast('Đã lưu HTML/CSS thông báo');}catch(error){toast(error.message);}finally{button.disabled=false;}}
 async function saveTargets(){const button=$('saveTargetsBtn');button.disabled=true;try{await request('/api/admin/settings',{method:'POST',body:JSON.stringify({satellite_targets:$('satelliteTargets').value})});await loadSettings();toast('Đã lưu danh sách vệ tinh');}catch(error){toast(error.message);}finally{button.disabled=false;}}
 function configureAutoScan(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;}if($('autoScan').checked)autoTimer=setInterval(scanHealth,5000);}

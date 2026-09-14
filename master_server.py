@@ -36,6 +36,8 @@ from zoneinfo import ZoneInfo
 DEFAULT_CHUNK_LIMIT = 15
 # Chunk được cố định để tránh client thay đổi kích thước qua API.
 MAX_CHUNK_LIMIT = 15
+DEFAULT_MAX_ACCOUNTS_PER_JOB = 1_000
+MAX_CONFIGURED_ACCOUNTS_PER_JOB = 1_000_000
 DEFAULT_DB_PATH = Path(__file__).resolve().with_name("master.db")
 DEFAULT_LEASE_MINUTES = 3
 MAX_SATELLITE_LEASE_MINUTES = 3
@@ -764,6 +766,16 @@ def _setting(store: Any, key: str, default: str = "") -> str:
     return str(row[0]) if row and row[0] is not None else default
 
 
+def _max_accounts_per_job(store: Any) -> int:
+    try:
+        value = int(_setting(store, "max_accounts_per_job", str(DEFAULT_MAX_ACCOUNTS_PER_JOB)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ACCOUNTS_PER_JOB
+    if not 1 <= value <= MAX_CONFIGURED_ACCOUNTS_PER_JOB:
+        return DEFAULT_MAX_ACCOUNTS_PER_JOB
+    return value
+
+
 def _notice_payload(store: Any) -> dict[str, Any]:
     """Return editable HTML/CSS, falling back to the old title/body settings."""
     title = _setting(store, "notice_title", DEFAULT_NOTICE_TITLE)
@@ -1075,11 +1087,11 @@ class MasterHandler(BaseHTTPRequestHandler):
                 mt = self.server.master_token or ""
                 is_master = bool(mt and tok and secrets.compare_digest(tok.strip(), mt.strip()))
                 if is_master:
-                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": True, "preview": _preview_key(tok), "info": {"mode": "master_token"}})
+                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": True, "preview": _preview_key(tok), "max_accounts_per_job": _max_accounts_per_job(self.server.store), "info": {"mode": "master_token"}})
                     return
                 ok, info = _verify_license_key(tok)
                 if ok:
-                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "preview": _preview_key(tok), "info": info})
+                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": False, "preview": _preview_key(tok), "max_accounts_per_job": _max_accounts_per_job(self.server.store), "info": info})
                 else:
                     self._json(HTTPStatus.OK, {"ok": False, "valid": False, "error": info.get("error") or "key không hợp lệ", "info": info,
                         "debug": {"token_len": len(tok), "master_token_len": len(mt), "token_preview": _preview_key(tok)}})
@@ -1226,11 +1238,11 @@ class MasterHandler(BaseHTTPRequestHandler):
                 mt = self.server.master_token or ""
                 is_master = bool(mt and tok and secrets.compare_digest(tok.strip(), mt.strip()))
                 if is_master:
-                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": True, "preview": _preview_key(tok), "info": {"mode": "master_token"}})
+                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": True, "preview": _preview_key(tok), "max_accounts_per_job": _max_accounts_per_job(self.server.store), "info": {"mode": "master_token"}})
                     return
                 ok, info = _verify_license_key(tok)
                 if ok:
-                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "preview": _preview_key(tok), "info": info})
+                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": False, "preview": _preview_key(tok), "max_accounts_per_job": _max_accounts_per_job(self.server.store), "info": info})
                 else:
                     self._json(HTTPStatus.OK, {"ok": False, "valid": False, "error": info.get("error") or "key không hợp lệ", "info": info})
                 return
@@ -1253,6 +1265,7 @@ class MasterHandler(BaseHTTPRequestHandler):
             "notice": _notice_payload(store),
             "satellite_targets": targets_text,
             "satellite_count": len(parse_satellite_targets(targets_text)),
+            "max_accounts_per_job": _max_accounts_per_job(store),
         })
 
     def _handle_admin_settings_save(self) -> None:
@@ -1262,6 +1275,7 @@ class MasterHandler(BaseHTTPRequestHandler):
             return
         notice = body.get("notice")
         targets_value = body.get("satellite_targets")
+        max_accounts_value = body.get("max_accounts_per_job")
         values: dict[str, str] = {}
         if notice is not None:
             if not isinstance(notice, dict):
@@ -1304,6 +1318,18 @@ class MasterHandler(BaseHTTPRequestHandler):
                 return
             normalized = "\n".join(f"[{target['label']}] {target['url']}" for target in targets)
             values["satellite_targets"] = normalized + ("\n" if normalized else "")
+        if max_accounts_value is not None:
+            try:
+                if isinstance(max_accounts_value, bool) or (isinstance(max_accounts_value, float) and not max_accounts_value.is_integer()):
+                    raise ValueError
+                max_accounts_per_job = int(max_accounts_value)
+            except (TypeError, ValueError):
+                self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "giới hạn tài khoản/job phải là số nguyên"})
+                return
+            if not 1 <= max_accounts_per_job <= MAX_CONFIGURED_ACCOUNTS_PER_JOB:
+                self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "giới hạn tài khoản/job phải từ 1 đến 1.000.000"})
+                return
+            values["max_accounts_per_job"] = str(max_accounts_per_job)
         if not values:
             self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "không có cấu hình để lưu"})
             return
@@ -1501,6 +1527,17 @@ class MasterHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             return
+        store = self.server.store
+        max_accounts_per_job = _max_accounts_per_job(store)
+        if not bool((auth or {}).get("is_admin")) and len(parsed) > max_accounts_per_job:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
+                "ok": False,
+                "code": "ACCOUNT_LIMIT_REACHED",
+                "error": f"Mỗi job được gửi tối đa {max_accounts_per_job:,} tài khoản. Danh sách hiện có {len(parsed):,} tài khoản.",
+                "submitted_accounts": len(parsed),
+                "max_accounts_per_job": max_accounts_per_job,
+            })
+            return
         # Cố định 15 account/chunk; không nhận cấu hình từ client.
         chunk_size = DEFAULT_CHUNK_LIMIT
         chunks = split_chunks(parsed, chunk_size)
@@ -1512,7 +1549,6 @@ class MasterHandler(BaseHTTPRequestHandler):
             for chunk in chunks
         ]
 
-        store = self.server.store
         owner_hash = (auth or {}).get("owner_hash", "") if auth else ""
         owner_preview = (auth or {}).get("owner_preview", "") if auth else ""
         job_id = 0

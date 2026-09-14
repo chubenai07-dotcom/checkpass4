@@ -1549,16 +1549,39 @@ class MasterHandler(BaseHTTPRequestHandler):
             for chunk in chunks
         ]
 
+        is_admin = bool((auth or {}).get("is_admin"))
         owner_hash = (auth or {}).get("owner_hash", "") if auth else ""
+        auth_token = str((auth or {}).get("token") or "")
+        if not owner_hash and auth_token:
+            owner_hash = _hash_key(auth_token)
         owner_preview = (auth or {}).get("owner_preview", "") if auth else ""
         job_id = 0
         try:
-            # Giữ job ở trạng thái trung gian cho tới khi toàn bộ chunk đã lưu.
-            # Vệ tinh và _check_finish_all_jobs chỉ xử lý job "open".
-            job_id = store.exec(
-                "INSERT INTO jobs (created_at, total, chunk_size, status, owner_hash, owner_preview) VALUES (?,?,?,?,?,?)",
-                (_now(), len(parsed), chunk_size, "creating", owner_hash, owner_preview),
-            )
+            with self.server.job_creation_lock:
+                active_key_job = None
+                if owner_hash:
+                    active_key_job = store.fetchone(
+                        "SELECT id FROM jobs WHERE owner_hash=? AND status IN ('creating','open') ORDER BY id DESC LIMIT 1",
+                        (owner_hash,),
+                    )
+                    if active_key_job is None and is_admin:
+                        active_key_job = store.fetchone(
+                            "SELECT id FROM jobs WHERE owner_hash='' AND owner_preview='admin' AND status IN ('creating','open') ORDER BY id DESC LIMIT 1"
+                        )
+                if active_key_job is not None:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "ok": False,
+                        "code": "KEY_RUNNING_JOB_LIMIT_REACHED",
+                        "error": "Mỗi key chỉ được có 1 job đang chạy. Vui lòng chờ job hiện tại hoàn tất hoặc dừng job đó trước.",
+                        "active_job_id": int(active_key_job[0]),
+                        "max_running_jobs_per_key": 1,
+                    })
+                    return
+                # "creating" giữ chỗ trước khi lưu chunks, nên request đồng thời sẽ bị chặn.
+                job_id = store.exec(
+                    "INSERT INTO jobs (created_at, total, chunk_size, status, owner_hash, owner_preview) VALUES (?,?,?,?,?,?)",
+                    (_now(), len(parsed), chunk_size, "creating", owner_hash, owner_preview),
+                )
             if not job_id:
                 row = store.fetchone("SELECT MAX(id) FROM jobs")
                 if row and row[0]:
@@ -2331,6 +2354,7 @@ class CoordinatorServer(ThreadingHTTPServer):
         self.store = store
         self.master_token = master_token
         self.claim_lock = threading.Lock()
+        self.job_creation_lock = threading.Lock()
 
 
 def parse_args() -> argparse.Namespace:

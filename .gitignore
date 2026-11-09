@@ -26,3 +26,8 @@ master.db-shm
 master.db-wal
 master_jobs.db
 data.db
+
+# UpLv deploy payload and private runtime state
+uplv_state/
+uplv_runtime/**/_data/
+!uplv_runtime/pve_runtime/vendor/*.pyc

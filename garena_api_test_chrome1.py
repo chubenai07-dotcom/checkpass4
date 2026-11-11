@@ -67,6 +67,8 @@ ACCOUNT_MAX_ATTEMPTS = 3
 KIENTUONG_MAX_RETRIES = 6
 KIENTUONG_MAX_ATTEMPTS = 1 + KIENTUONG_MAX_RETRIES
 TCP_FAST_REJECTION_RATE_LIMIT_MS = 600
+THROTTLE_MAX_ATTEMPTS = 10
+THROTTLE_RETRY_DELAY = 1.0
 
 
 def _normalized_error_text(value: Any) -> str:
@@ -87,6 +89,7 @@ def _text_suggests_rate_limit(value: Any) -> bool:
             "rate_limit",
             "ratelimit",
             "too many request",
+            "too_many_requests",
             "throttl",
             "request frequency",
             "qua nhieu yeu cau",
@@ -100,6 +103,8 @@ def tcp_rate_limit_suspected(error: Any, elapsed_ms: int | float | None = None) 
     """Recognize explicit rate-limit signals; response speed alone is not one."""
 
     if getattr(error, "code", None) == 429:
+        return True
+    if (getattr(error, "garena_command", 0), getattr(error, "garena_result", 0)) == (0x1BA, 3):
         return True
     if _text_suggests_rate_limit(error):
         return True
@@ -164,6 +169,19 @@ def resilient_tcp_client_type(tcp_module: Any) -> type:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             self.ignored_server_commands: list[int] = []
+
+        def get_sso_key(self) -> Any:
+            for attempt in range(THROTTLE_MAX_ATTEMPTS):
+                try:
+                    return super().get_sso_key()
+                except Exception as exc:
+                    if (
+                        (getattr(exc, "garena_command", 0), getattr(exc, "garena_result", 0))
+                        != (0x1BA, 3)
+                        or attempt + 1 >= THROTTLE_MAX_ATTEMPTS
+                    ):
+                        raise
+                    time.sleep(THROTTLE_RETRY_DELAY)
 
         def _request(self, command: int, payload: bytes, key: bytes | None = None) -> bytes:
             if self.socket is None:
@@ -411,6 +429,7 @@ def format_register_time(value: Any) -> str:
 
 def format_player_event_time(value: Any) -> str:
     """Format a player event Unix timestamp with time in Vietnam timezone."""
+
     if isinstance(value, bool):
         return ""
     try:
@@ -425,16 +444,20 @@ def format_player_event_time(value: Any) -> str:
 
 
 def player_ban_fields(player: Any) -> dict[str, str]:
-    """Return formatted ban times only for a player with non-empty banInfo."""
+    """Return ban timestamps only when the player has a non-empty banInfo."""
+
     empty = {"banTime": "", "unbanTime": ""}
     if not isinstance(player, dict):
         return empty
     ban_info = player.get("banInfo")
     if not isinstance(ban_info, dict) or not ban_info:
         return empty
+
+    ban_time = ban_info.get("banTime")
+    unban_time = ban_info.get("unbanTime")
     return {
-        "banTime": format_player_event_time(ban_info.get("banTime")),
-        "unbanTime": format_player_event_time(ban_info.get("unbanTime")),
+        "banTime": format_player_event_time(ban_time),
+        "unbanTime": format_player_event_time(unban_time),
     }
 
 
@@ -465,6 +488,26 @@ class WebSession:
         )
 
     def request(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        json_body: Any | None = None,
+        form_body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, str, str, Any]:
+        for attempt in range(THROTTLE_MAX_ATTEMPTS):
+            response = self._request_once(
+                url, method=method, json_body=json_body, form_body=form_body, headers=headers
+            )
+            body = response[3]
+            throttled = isinstance(body, dict) and body.get("error") == "error_too_many_requests"
+            if not throttled or attempt + 1 >= THROTTLE_MAX_ATTEMPTS:
+                return response
+            time.sleep(THROTTLE_RETRY_DELAY)
+        raise RuntimeError("Invalid throttle retry configuration")
+
+    def _request_once(
         self,
         url: str,
         *,
@@ -1137,6 +1180,7 @@ def run_api_tests(tcp_module: Any, account: str, password: str, timeout: float) 
                 results["tcp"]["sso_error"] = (
                     str(exc).strip() or type(exc).__name__
                 )[:500]
+                results["tcp"]["rate_limit_suspected"] = tcp_rate_limit_suspected(exc)
             else:
                 results["tcp"].update(
                     {
@@ -1229,6 +1273,11 @@ def run_api_tests(tcp_module: Any, account: str, password: str, timeout: float) 
             results["elapsed_ms"] = round((time.monotonic() - started) * 1000)
             return results
 
+    if kientuong_requires_grant(results):
+        password = ""
+        results["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+        return results
+
     kientuong_complete = kientuong_player_has_level(player_api)
 
     if not kientuong_complete:
@@ -1288,6 +1337,8 @@ def run_api_tests(tcp_module: Any, account: str, password: str, timeout: float) 
             kientuong_attempts += 1
             try:
                 kientuong_auth, web_player = _do_kientuong()
+                if kientuong_requires_grant({"kientuong": kientuong_auth, "kientuong_player": web_player}):
+                    break
                 if result_rate_limit_suspected(
                     {"auth": kientuong_auth, "player": web_player}
                 ):
@@ -1313,7 +1364,9 @@ def run_api_tests(tcp_module: Any, account: str, password: str, timeout: float) 
             and kientuong_attempts >= KIENTUONG_MAX_ATTEMPTS
         )
         kientuong_auth["no_character_responses"] = no_character_responses
-        kientuong_auth["no_character_confirmed"] = bool(no_character_responses >= 2)
+        kientuong_auth["no_character_confirmed"] = bool(
+            no_character_responses >= 2
+        )
         results["web_auth"]["kientuong"] = kientuong_auth
         results["apis"]["kientuong_player"] = web_player
 
@@ -1531,7 +1584,10 @@ def public_batch_row(row: dict[str, Any]) -> dict[str, str]:
     public["registerDate"] = public["registerDate"].split(" ", 1)[0]
     player_status = public["player_status"].casefold()
     if "khóa" in player_status or "ban" in player_status:
-        public.update({field: str(row.get(field, "") or "") for field in BATCH_BAN_FIELDNAMES})
+        public.update({
+            field: str(row.get(field, "") or "")
+            for field in BATCH_BAN_FIELDNAMES
+        })
     return public
 
 REQUIRED_ACCOUNT_LABEL = "hồ sơ tài khoản"
@@ -1562,11 +1618,26 @@ def batch_rate_limit_suspected(result: Any) -> bool:
     return result_rate_limit_suspected(result)
 
 
+def kientuong_requires_grant(result: Any) -> bool:
+    """Recognize the OAuth response classified as CTNV by checkpass."""
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("error") or "").strip() == "error_require_grant":
+        return True
+    return any(
+        kientuong_requires_grant(result.get(key))
+        for key in ("body", "kientuong", "kientuong_player", "account_to_kientuong_oauth",
+                    "web_auth", "apis", "tcp_to_web_probe")
+    )
+
+
 def batch_required_missing(result: Any) -> list[str]:
     """Chi can Kien Tuong - Ctnv hoac co level moi la du."""
 
     if not isinstance(result, dict):
         return [REQUIRED_KIENTUONG_LABEL]
+    if kientuong_requires_grant(result):
+        return []
     apis = result.get("apis") or {}
     probe = result.get("tcp_to_web_probe") or {}
     web_auth = result.get("web_auth") or {}
@@ -1710,7 +1781,9 @@ def batch_check_one(
                     else:
                         login_rejection_signature = signature
                         login_rejection_confirmations = 1
-                    row["login_rejection_confirmations"] = str(login_rejection_confirmations)
+                    row["login_rejection_confirmations"] = str(
+                        login_rejection_confirmations
+                    )
                     if login_rejection_confirmations >= BATCH_LOGIN_REJECTION_CONFIRMATIONS:
                         login_rejected = True
                         break
@@ -1866,7 +1939,11 @@ def batch_check_one(
 
         kientuong_ok = bool(kientuong_api.get("ok") or probe_player.get("ok"))
         kientuong_auth = web_auth.get("kientuong") or {}
-        no_character_confirmed = bool(kientuong_auth.get("no_character_confirmed"))
+        grant_required = kientuong_requires_grant(result)
+        no_character_confirmed = bool(kientuong_auth.get("no_character_confirmed")) and not grant_required
+        if grant_required:
+            row["result_type"] = "Lỗi CTNV"
+            row["player_status"] = "Lỗi CTNV (error_require_grant)"
         if no_character_confirmed and not player:
             row["player_status"] = "Chưa tạo nhân vật"
         if not row["level"] and no_character_confirmed:
@@ -2027,9 +2104,7 @@ def _batch_worker(
         with server.batch_lock:
             server.batch_rows.append({
                 "stt": "-", "account": "-", "status": "CHƯA THỂ CHECK", "result_type": "Chưa thể check", "uid": "", "name": "",
-                "level": "",
-        "registerTime": "",
-        "registerDate": "", "session_key": "", "elapsed_ms": "",
+                "level": "", "session_key": "", "elapsed_ms": "",
             })
     finally:
         for credential in credentials:
@@ -2050,7 +2125,7 @@ def _batch_worker(
 def run_batch(args: argparse.Namespace) -> int:
     import garena_tcp_rate_limit_probe as batch_helpers
 
-    credentials = batch_helpers.load_credentials(args.file.resolve(), limit=1_000_000)
+    credentials = batch_helpers.load_credentials(args.file.resolve(), limit=999999999999)
     tcp_module = tcp_ui.load_verified_tcp_module()
 
     print(

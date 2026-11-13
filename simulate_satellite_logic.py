@@ -174,7 +174,7 @@ def run_live_accounts(
 def batch_case(engine: Any, fake_run: Callable[..., dict[str, Any]]) -> dict[str, str]:
     original = engine.run_api_tests
     try:
-        engine.run_api_tests = fake_run
+        engine.run_api_tests = lambda *args, **kwargs: fake_run(*args)
         return engine.batch_check_one(
             Credential(), object(), 1.0, InstantGate(), InstantStopEvent()
         )
